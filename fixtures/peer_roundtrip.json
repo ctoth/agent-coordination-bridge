@@ -1,0 +1,51 @@
+{
+  "fixture_kind": "synthetic; contains no captured sessions or real task data",
+  "correlation": "synthetic-status-request",
+  "sender_name": "example-bridge",
+  "target_name": "example-worker",
+  "sender_address": "uds:synthetic-sender-pipe",
+  "target_address": "uds:synthetic-target-pipe",
+  "target_records": [
+    {
+      "type": "attachment",
+      "attachment": {
+        "type": "queued_command",
+        "origin": {
+          "kind": "peer",
+          "from": "uds:synthetic-sender-pipe",
+          "body": "Please report status; correlation synthetic-status-request"
+        }
+      }
+    },
+    {
+      "type": "assistant",
+      "message": {
+        "content": [{
+          "type": "tool_use",
+          "id": "synthetic-reply-tool",
+          "name": "SendMessage",
+          "input": {
+            "to": "uds:synthetic-sender-pipe",
+            "message": "synthetic-status-request: working on the example task"
+          }
+        }]
+      }
+    },
+    {
+      "type": "user",
+      "message": {
+        "content": [{
+          "type": "tool_result",
+          "tool_use_id": "synthetic-reply-tool",
+          "content": [{"type": "text", "text": "{\"success\":true}"}]
+        }]
+      }
+    }
+  ],
+  "received_event": {
+    "type": "user",
+    "message": {
+      "content": "Another Claude session sent a message:\n<cross-session-message from=\"uds:synthetic-target-pipe\">\nsynthetic-status-request: working on the example task\n</cross-session-message>"
+    }
+  }
+}
