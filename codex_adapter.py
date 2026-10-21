@@ -215,18 +215,18 @@ def find_reply(items, old_items, message_id, prompt):
     return None
 
 
-def find_turn(rpc, thread_id, turn_id):
+def find_turn(rpc, thread_id, matches):
     cursor, cursors = None, set()
     while True:
         page = rpc.call("thread/turns/list", {
             "threadId": thread_id, "cursor": cursor, "limit": 20, "sortDirection": "desc", "itemsView": "full",
         })
         for turn in page["data"]:
-            if turn.get("id") == turn_id:
+            if matches(turn):
                 return turn
         cursor = page.get("nextCursor")
         if cursor is None:
-            raise Refused("recorded turn is no longer listed")
+            return None
         if cursor in cursors:
             raise Refused("repeated turns-list cursor")
         cursors.add(cursor)
@@ -292,12 +292,21 @@ def collect(rpc, mailbox, message_id):
     request = mailbox.request(message_id)
     if request["provider"] != "codex":
         raise Refused("not a Codex request")
-    if mailbox.collect(message_id)["outcome"] == "pending" and request.get("turnId"):
-        turn = find_turn(rpc, request["threadId"], request["turnId"])
-        reply = find_reply(turn.get("items", []), set(request["oldItems"]), message_id, request["prompt"])
-        if reply is not None:
+    if mailbox.collect(message_id)["outcome"] == "pending":
+        turn_id = request.get("turnId")
+        if turn_id:
+            turn = find_turn(rpc, request["threadId"], lambda turn: turn.get("id") == turn_id)
+            if turn is None:
+                raise Refused("recorded turn is no longer listed")
+        else:
+            # A lost send response leaves no turn ID; the turn holding our client message ID is the one.
+            turn = find_turn(rpc, request["threadId"], lambda turn: any(
+                item.get("type") == "userMessage" and item.get("clientId") == message_id
+                for item in turn.get("items", [])))
+        reply = turn and find_reply(turn.get("items", []), set(request["oldItems"]), message_id, request["prompt"])
+        if reply:
             mailbox.store_reply(message_id, {"text": reply, "source": "codex_agent_message",
-                                             "threadId": request["threadId"], "turnId": request["turnId"]})
+                                             "threadId": request["threadId"], "turnId": turn["id"]})
     return mailbox.collect(message_id)
 
 

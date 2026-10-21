@@ -77,8 +77,13 @@ def run(args):
     def ask(codex, rpc, endpoint):
         with closing(Mailbox(args.mailbox)) as mailbox:
             return codex.inquire(rpc, endpoint, target, args.request_id, mailbox, args.receipts,
-                                 args.timeout or 30, question=question)
+                                 codex_timeout(args), question=question)
     return codex_run(args, None, ask)
+
+
+def codex_timeout(args):
+    # Only a missing timeout gets the default; 0 must reach connect() and be refused.
+    return 30 if args.timeout is None else args.timeout
 
 
 def codex_run(args, recorded, action):
@@ -89,7 +94,7 @@ def codex_run(args, recorded, action):
     if recorded and endpoint != recorded:
         raise ValueError("--socket differs from the endpoint this request was sent to")
     try:
-        with codex.connect(args.codex, endpoint, args.timeout or 30) as rpc:
+        with codex.connect(args.codex, endpoint, codex_timeout(args)) as rpc:
             return action(codex, rpc, endpoint), 0
     except codex.Uncertain as error:
         return {"outcome": "uncertain", "error": str(error)}, 2

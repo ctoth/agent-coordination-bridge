@@ -1,6 +1,6 @@
 # Agent Coordination Bridge
 
-**Ask a running Claude Code or Codex session a question, and get back a reply that provably answers it.**
+**Ask a running Claude Code or Codex session a question, and get back the reply that carries that question's ID.**
 
 ```sh
 python agent_bridge.py ask --provider claude --target <session-uuid> \
