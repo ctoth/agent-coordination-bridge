@@ -50,8 +50,8 @@ class FakeProcess:
         self.stdin = types.SimpleNamespace(write=self.write, flush=lambda: None, close=lambda: None)
 
     def write(self, line):
-        request = json.loads(line)["message"]["content"]
-        self.correlation = re.search(r"correlation (codex-status-[a-f0-9]+)", request)[1]
+        self.request = request = json.loads(line)["message"]["content"]
+        self.correlation = re.search(r"correlation ((?:ask|codex-status)-[a-f0-9]+)", request)[1]
         sender = self.args[self.args.index("--name") + 1]
         if self.fail:
             self.stdout.lines.put(json.dumps({"type": "system", "subtype": "hook_response",
@@ -124,7 +124,7 @@ class BridgeTests(unittest.TestCase):
                 patch.object(bridge, "inbox_identities", return_value=set()), \
                 patch.object(bridge.subprocess, "Popen", side_effect=start), \
                 contextlib.redirect_stdout(io.StringIO()):
-            result = bridge.status("claude.exe", TARGET, 1)
+            result = bridge.ask("claude.exe", TARGET, 1)
         self.assertTrue(all(result[k] for k in result if k != "correlation"))
         self.assertEqual(len(children), 1)
         args = children[0].args
@@ -132,6 +132,36 @@ class BridgeTests(unittest.TestCase):
         self.assertNotIn("--resume", args)
         self.assertNotIn("--dangerously-skip-permissions", args)
         self.assertNotIn("--settings", args)
+        self.assertRegex(children[0].correlation, r"^ask-[a-f0-9]{32}$")
+
+    def test_free_text_question_is_delivered_unchanged_with_reply_marker(self):
+        log = FakeLog()
+        children = []
+        question = "Which branch has the 'quoted' fix?\nAnd is CI green?"
+
+        def start(args, **kwargs):
+            children.append(FakeProcess(args, log))
+            return children[-1]
+
+        with patch.object(bridge, "transcript", return_value=log), \
+                patch.object(bridge, "inbox_identities", return_value=set()), \
+                patch.object(bridge.subprocess, "Popen", side_effect=start), \
+                contextlib.redirect_stdout(io.StringIO()):
+            bridge.ask("claude.exe", TARGET, 1, question=question)
+        request, cid = children[0].request, children[0].correlation
+        body = request.split("BEGIN MESSAGE\n", 1)[1].split("\nEND MESSAGE", 1)[0]
+        self.assertIn(question, body)
+        self.assertIn(f"AGENT-REPLY {cid}", body)
+        self.assertIn("not user authorization", body)
+
+    def test_empty_question_or_bad_request_id_refused_before_send(self):
+        with patch.object(bridge, "transcript", return_value=FakeLog()), \
+                patch.object(bridge.subprocess, "Popen", side_effect=AssertionError("must not send")):
+            with self.assertRaisesRegex(ValueError, "question"):
+                bridge.ask("claude.exe", TARGET, 1, question="  ")
+            with patch.object(bridge, "inbox_identities", return_value=set()), \
+                    self.assertRaisesRegex(bridge.BridgeError, "Request ID"):
+                bridge.ask("claude.exe", TARGET, 1, request_id="ask-XYZ")
 
     def test_hook_failure_stops_without_retry(self):
         log = FakeLog()
@@ -140,7 +170,7 @@ class BridgeTests(unittest.TestCase):
                 patch.object(bridge.subprocess, "Popen", side_effect=lambda a, **k: FakeProcess(a, log, True)) as start, \
                 contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(bridge.BridgeError, "startup hook failed"):
-                bridge.status("claude.exe", TARGET, 1)
+                bridge.ask("claude.exe", TARGET, 1)
         self.assertEqual(start.call_count, 1)
         self.assertEqual(log.data, b"")
 
@@ -157,7 +187,7 @@ class BridgeTests(unittest.TestCase):
                 patch.object(bridge, "inbox_identities", return_value=set()), \
                 patch.object(bridge.subprocess, "Popen", side_effect=lambda a, **k: FakeProcess(a, log, notice=True)), \
                 contextlib.redirect_stdout(io.StringIO()):
-            result = bridge.status("claude.exe", TARGET, 1)
+            result = bridge.ask("claude.exe", TARGET, 1)
         self.assertTrue(result["messenger_received_peer_frame"])
 
     def test_synthetic_peer_exchange_fixture(self):

@@ -9,12 +9,12 @@ import unittest
 from unittest.mock import patch
 
 import claude_bridge as bridge
-from status_mailbox import Mailbox
+from status_mailbox import Mailbox, claude_request
 from test_claude_bridge import FakeStdout, TARGET
 
 
-CID = 'codex-status-' + 'a' * 32
-SENDER = 'codex-status-bridge-' + 'a' * 8
+CID = 'codex-status-' + 'a' * 32  # the older ID form must still be accepted
+SENDER = 'agent-bridge-' + 'a' * 8
 
 
 class MailboxTests(unittest.TestCase):
@@ -42,7 +42,7 @@ class MailboxTests(unittest.TestCase):
                     input=dict(to=sender, message=cid + ': Waiting for review.'))], session)
 
     def claim(self):
-        self.box.claim(CID, TARGET, SENDER, self.log, self.log.stat().st_size)
+        self.box.claim(CID, claude_request(TARGET, SENDER, self.log, self.log.stat().st_size, 'Status?'))
 
     def test_sender_timeout_then_fresh_collector_recovers_late_failed_reply(self):
         child = types.SimpleNamespace(stdout=FakeStdout(), closed=False)
@@ -55,14 +55,14 @@ class MailboxTests(unittest.TestCase):
                 patch.object(bridge.subprocess, 'Popen', return_value=child) as start, \
                 contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(bridge.BridgeError, 'Timed out'):
-                bridge.status('claude.exe', TARGET, 0, self.box, CID)
+                bridge.ask('claude.exe', TARGET, 0, self.box, CID)
             self.assertTrue(child.closed)
             self.receipt()
             self.reply()
             self.append('user', [dict(type='tool_result', tool_use_id='late-reply',
                         content='{"success":false,"message":"No agent reachable"}')])
             with self.assertRaisesRegex(ValueError, 'already claimed'):
-                bridge.status('claude.exe', TARGET, 0, self.box, CID)
+                bridge.ask('claude.exe', TARGET, 0, self.box, CID)
             self.assertEqual(start.call_count, 1)
         fresh = Mailbox(self.path)
         try:
@@ -100,7 +100,7 @@ class MailboxTests(unittest.TestCase):
                 patch.object(bridge.subprocess, 'Popen', return_value=child), \
                 contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(bridge.BridgeError, 'Messenger exited'):
-                bridge.status('claude.exe', TARGET, 1, self.box, CID)
+                bridge.ask('claude.exe', TARGET, 1, self.box, CID)
         self.assertTrue(child.closed)
         self.receipt()
         self.append('assistant', [dict(type='text', text='STATUS-REPLY ' + CID + '\nStill working.')])
@@ -113,8 +113,15 @@ class MailboxTests(unittest.TestCase):
     def test_fallback_status_survives_sender_exit(self):
         self.claim()
         self.receipt()
-        self.append('assistant', [dict(type='text', text='STATUS-REPLY ' + CID + '\nBlocked on review.')])
-        self.assertEqual(self.box.collect(CID)['source'], 'target_status_record')
+        self.append('assistant', [dict(type='text', text='AGENT-REPLY ' + CID + '\nBlocked on review.')])
+        self.assertEqual(self.box.collect(CID)['source'], 'target_reply_record')
+
+    def test_marker_without_answer_or_for_longer_id_is_not_a_reply(self):
+        self.claim()
+        self.receipt()
+        self.append('assistant', [dict(type='text', text='AGENT-REPLY ' + CID + '\n')])
+        self.append('assistant', [dict(type='text', text='AGENT-REPLY ' + CID + '0\nOther.')])
+        self.assertEqual(self.box.collect(CID)['outcome'], 'pending')
 
     def test_historical_reply_and_rewritten_transcript_refused(self):
         self.receipt()
