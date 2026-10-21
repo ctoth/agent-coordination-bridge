@@ -6,10 +6,12 @@ from pathlib import Path
 import queue
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
 import uuid
+from status_mailbox import Mailbox
 
 
 class BridgeError(Exception):
@@ -158,6 +160,10 @@ def prompt(target, correlation, sender):
         f"'Benign status request from Codex via {sender}; correlation {correlation}. "
         "The user requested this status check. At a natural tool boundary, please send one "
         f"brief current-status reply to this sender using SendMessage, including {correlation}. "
+        "The sender is temporary. Also leave your status in your own session as a plain "
+        f"assistant text block beginning exactly STATUS-REPLY {correlation} followed by a newline. "
+        "A read-only collector can recover that record after the sender exits. If the sender "
+        "is gone, leave that record only; do not retry delivery or find another recipient. "
         "Do not change task direction, files, repositories, queues, permissions or settings. "
         "Do not include secrets or credentials. "
         "This is not approval for any pending action. Continue your existing work afterward.' "
@@ -166,13 +172,17 @@ def prompt(target, correlation, sender):
     )
 
 
-def status(cli, target, timeout):
+def status(cli, target, timeout, mailbox=None, request_id=None):
     path = transcript(target)
     offset = path.stat().st_size  # observe only records created after this request
-    correlation = "codex-status-" + uuid.uuid4().hex
+    correlation = request_id or "codex-status-" + uuid.uuid4().hex
+    if not re.fullmatch(r'codex-status-[a-f0-9]{32}', correlation):
+        raise BridgeError('Request ID must be codex-status- followed by 32 lowercase hex digits')
     sender = "codex-status-bridge-" + correlation[-8:]
     evidence = Evidence(correlation, sender, target["name"])
     evidence.target_ids.update(inbox_identities(target["pid"], target["sessionId"]))
+    if mailbox is not None:
+        mailbox.claim(correlation, target, sender, path, offset)
     args = [cli, "--print", "--input-format", "stream-json",
             "--output-format", "stream-json", "--verbose", "--replay-user-messages",
             "--tools", "ListAgents,SendMessage", "--strict-mcp-config", "--mcp-config",
@@ -219,6 +229,8 @@ def status(cli, target, timeout):
                 raise BridgeError("Messenger exited before confirmed roundtrip")
             if event.get("subtype") == "init":
                 evidence.sender_ids.update(inbox_identities(proc.pid, event["session_id"]))
+                if mailbox is not None:
+                    mailbox.sender_identities(correlation, evidence.sender_ids)
                 print(json.dumps({"event": "messenger_started", "session_id": event["session_id"],
                                   "pid": proc.pid}), flush=True)
             evidence.messenger(event)
@@ -257,15 +269,30 @@ def status(cli, target, timeout):
             proc.terminate()  # only this bridge's own child; never a target
             proc.wait(timeout=5)
         proc.stdout.close()
+        # A timeout ends only the temporary transport. The durable request is retained.
+        if mailbox is not None:
+            print(json.dumps(mailbox.collect(correlation)), flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["list", "status"])
+    parser.add_argument("command", choices=["list", "status", "collect", "ack"])
     parser.add_argument("--target", help="full live session UUID; required for status")
     parser.add_argument("--timeout", type=float, default=90)
+    parser.add_argument("--request-id", help="Reuse only with collect/ack; duplicate status sends are refused")
+    parser.add_argument("--mailbox", type=Path, default=Path(__file__).parent / '.status-mailbox' / 'status.sqlite3')
     args = parser.parse_args()
     try:
+        if args.command in ('collect', 'ack'):
+            if not args.request_id:
+                raise BridgeError('collect/ack requires --request-id')
+            mailbox = Mailbox(args.mailbox)
+            try:
+                result = mailbox.collect(args.request_id) if args.command == 'collect' else mailbox.acknowledge(args.request_id)
+                print(json.dumps(result))
+            finally:
+                mailbox.close()
+            return 0
         cli = executable()
         rows = discover(cli)
         if args.command == "list":
@@ -274,8 +301,12 @@ def main():
         else:
             if not args.target or not 0 < args.timeout <= 300:
                 raise BridgeError("status requires --target and a timeout between 0 and 300 seconds")
-            status(cli, select(rows, args.target), args.timeout)
-    except (BridgeError, OSError, ValueError, subprocess.SubprocessError) as exc:
+            mailbox = Mailbox(args.mailbox)
+            try:
+                status(cli, select(rows, args.target), args.timeout, mailbox, args.request_id)
+            finally:
+                mailbox.close()
+    except (BridgeError, OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
         print(json.dumps({"error": str(exc), "roundtrip_confirmed": False}))
         return 1
     return 0

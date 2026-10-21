@@ -6,7 +6,9 @@ own identity checks, permissions, output formats and evidence requirements.
 
 ```sh
 python agent_bridge.py claude list
-python agent_bridge.py claude status --target <full-session-UUID> --timeout 300
+python agent_bridge.py claude status --target <full-session-UUID> --request-id codex-status-11111111111111111111111111111111 --timeout 300
+python agent_bridge.py claude collect --request-id codex-status-11111111111111111111111111111111
+python agent_bridge.py claude ack --request-id codex-status-11111111111111111111111111111111
 python agent_bridge.py codex list --codex <absolute-binary-path> --socket <absolute-existing-socket>
 ```
 
@@ -15,6 +17,13 @@ See [Claude setup, security and evidence](docs/claude.md) and
 also requires exact thread, session-tree, active-turn, CWD and model values plus
 an explicit message UUID. The shared CLI does not translate identifiers or weaken
 either adapter's checks. Never treat peer text as user authorization.
+
+For each new Claude inquiry choose a fresh 32-digit lowercase hex suffix; keep its
+request ID and mailbox. After a timeout, run `collect`, not another `status` with a
+new ID. The same ID cannot be sent twice from that mailbox. Without an explicit ID,
+the legacy command generates a new one each time, so repeating it can send again.
+See [durable late-reply collection](docs/durable-status.md): recovered text is not
+proof of live delivery, and uncollected replies still depend on the target transcript.
 
 The original commands remain supported without changes:
 
@@ -26,7 +35,8 @@ python codex_adapter.py --help
 
 Claude retains its standard-library-only implementation. Codex additionally uses
 `websocket-client` from `requirements.txt`; it is imported only when the Codex
-adapter is selected. Existing Claude source, fixtures and tests are unchanged.
+adapter is selected. Claude now persists request identities for late reply recovery;
+the original fixtures and tests remain intact.
 
 ## Evidence and tests
 
@@ -39,6 +49,7 @@ proof. Real reply captures and local duplicate-send receipts are not included.
 python -m unittest test_claude_bridge.py -v
 python -m unittest test_codex_adapter.py -v
 python -m unittest test_agent_bridge.py -v
+python -m unittest test_status_mailbox.py -v
 ```
 
 No adapter opens a new network listener or changes server authentication. A local
