@@ -1,7 +1,7 @@
-# Claude Code status bridge
+# Claude Code adapter
 
-A small Python CLI that asks an **already-running Claude Code session** for a
-status update and checks the reply. No Python dependencies beyond the standard library.
+Asks an **already-running Claude Code session** one question and checks the reply.
+No Python dependencies beyond the standard library.
 
 It uses `claude agents --json` to discover sessions, then launches a separate
 messenger Claude with only `ListAgents` and `SendMessage`. The selected existing
@@ -14,14 +14,16 @@ and cross-session messaging available in both sessions. Developed against native
 Windows Claude Code 2.1.304. Other versions/platforms are not validated here.
 
 ```sh
-python claude_bridge.py list
-python claude_bridge.py status --target <full-live-session-UUID> --timeout 300
+python agent_bridge.py list --provider claude
+python agent_bridge.py ask --provider claude --target <full-live-session-UUID> --message "<question>" --timeout 300
+python agent_bridge.py status --provider claude --target <full-live-session-UUID>
 ```
 
 Choose the full UUID from the listing and check its name/workspace first. The
 bridge refuses missing targets, duplicate session IDs and duplicate names. Each
-status command requests one benign status message with a new correlation ID.
-It asks the recipient to reply at a natural tool boundary and continue its work.
+command sends one question (up to 4000 characters; `status` uses a fixed one)
+with a correlation ID. It asks the recipient to answer at a natural tool boundary,
+starting with `AGENT-REPLY <id>`, and to continue its work.
 It does not automatically resend. The timeout is bounded to 300 seconds.
 
 The CLI emits JSON progress and three independent evidence flags:
@@ -78,7 +80,7 @@ clearly marked synthetic fixture; no real session captures are included.
 ## Tests
 
 ```sh
-python -m unittest test_claude_bridge.py -v
+python -m unittest test_claude_bridge.py test_status_mailbox.py -v
 ```
 
 Tests cover discovery errors, explicit target selection, correlation/sender

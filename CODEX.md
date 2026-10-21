@@ -1,12 +1,14 @@
-# Codex status coordination adapter
+# Codex adapter
 
 A small client for **an explicitly selected existing app-server**, using Codex's
 supported `app-server proxy --sock` byte tunnel and WebSocket JSON-RPC. It does not
 launch an app-server, resume or fork a session, interrupt a turn, grant approvals,
 read credentials, or open a listener.
 
-**Validation: live and synthetic, reported separately.** The 23 unit tests
-exercise protocol decisions and an in-memory WebSocket/JSON-RPC exchange. An
+**Validation: live and synthetic, reported separately.** The unit tests
+exercise protocol decisions and an in-memory WebSocket/JSON-RPC exchange. The live
+runs below used the earlier status-only version; free-text questions, the shared
+mailbox and idle-thread `turn/start` have been tested only synthetically. An
 authorized non-elevated Q-user run reached the original existing server and
 completed a single status inquiry/reply with the verified Qlatt Astra root;
 the production CLI returned `reply_observed` with exit code 0. No work commands
@@ -27,7 +29,7 @@ socket you are authorized to access. There is no implicit endpoint selection,
 server-start fallback, credential discovery, redirect, or reconnect.
 
 ```powershell
-python codex_adapter.py list --codex C:\approved\codex.exe --socket C:\approved\existing.sock
+python agent_bridge.py list --provider codex --codex C:\approved\codex.exe --socket C:\approved\existing.sock
 ```
 
 Inspect the returned exact thread/session IDs, CWD, model, status and latest turn
@@ -37,31 +39,49 @@ not a guaranteed process incarnation.
 race with changes and is not machine-wide: it lists only this server's runtimes.
 
 ```powershell
-python codex_adapter.py status --codex C:\approved\codex.exe --socket C:\approved\existing.sock --thread <UUID> --session <UUID> --turn <UUID> --cwd <EXACT-CWD> --model <EXACT-MODEL> --message-id <NEW-UUID>
+python agent_bridge.py ask --provider codex --codex C:\approved\codex.exe --socket C:\approved\existing.sock --thread <UUID> --session <UUID> --cwd <EXACT-CWD> --model <EXACT-MODEL> --request-id <NEW-UUID> --message "<question>" [--turn <ACTIVE-TURN-UUID>]
 ```
 
-The status command rechecks identity, loaded/active state, direct-input capability
-and the active turn. It sends only a fixed benign status inquiry, with the required
-server-side `expectedTurnId` guard. It refuses idle, waiting, unloaded, stale,
-unrelated, ephemeral, or insufficiently described targets. A race rejected by the server
-never becomes a start/resume/fork/interrupt operation.
+`status` instead of `ask` sends the fixed status question. Every question tells the
+recipient to answer starting with `AGENT-REPLY <id>`.
 
-One immutable local receipt is created and flushed **before** sending, keyed by
-endpoint/thread/message ID. Reusing that ID in the same thread is refused,
-including on a later turn, after a timeout or process restart. Distinct explicitly
-authorized requests may share an active turn; its expected-turn guard is unchanged.
-Historical turn-keyed receipts are preserved and their recorded message IDs still
-prevent reuse. Unreadable historical receipts refuse sending until inspected.
-Keep the same receipts directory (default `.coordination-receipts` beside the script); do not
-delete receipts, change stores, or use endpoint aliases to retry. They prevent
-accidental duplicate sends, not deliberate bypass or a compromised local user.
-An I/O failure can conservatively leave a receipt even when nothing was sent.
-Choose a fresh ID only for a new authorized request, never to retry an uncertain
-one. New receipt filenames start with `message-`; retain older receipt files too.
+**With `--turn`** the command rechecks identity, loaded/active state, direct-input
+capability and the active turn, then sends with `turn/steer` and the server-side
+`expectedTurnId` guard. It refuses waiting, unloaded, stale, unrelated, ephemeral,
+or insufficiently described targets. A race rejected by the server never becomes a
+start/resume/fork/interrupt operation.
+
+**Without `--turn`** the thread must be idle, non-ephemeral and accept direct input;
+the command sends with `turn/start`. That method has no expected-turn guard: the
+server calls `start_or_steer_turn` (codex-rs `app-server/src/request_processors/turn_processor.rs`),
+so if a turn began after the check, the question is steered into it. The response
+carries only the turn (`TurnStartResponse { turn }`), so the adapter cannot tell a
+started turn from a steered one. It records and polls whichever turn ID the server returned.
+
+Each request is committed to the shared SQLite mailbox (default
+`.status-mailbox/status.sqlite3`) **before** sending, keyed by its request ID. A
+claimed ID is refused again, including on another thread or turn, after a timeout or
+a process restart. Receipt files from earlier versions in `.coordination-receipts`
+are read, never written or deleted: their message IDs remain blocked, and an
+unreadable one refuses sending until inspected. Do not delete the mailbox or the
+receipts, change stores, or use endpoint aliases to retry. They prevent accidental
+duplicate sends, not deliberate bypass or a compromised local user. Choose a fresh
+ID only for a new authorized request, never to retry an uncertain one.
+
+A late reply can be collected without sending anything:
+
+```powershell
+python agent_bridge.py collect --request-id <UUID> --codex C:\approved\codex.exe
+```
+
+It reconnects to the endpoint recorded with the request, finds the recorded turn
+with `thread/turns/list`, and stores the first correlated reply. Without `--codex`
+it only reports what the mailbox already holds.
 
 Success requires both a new user-message item with the exact client message ID
 and prompt, and a subsequent new agent-message item beginning with the exact
-reply marker in the same selected thread/turn. Old matching text, notifications,
+reply marker (`AGENT-REPLY`, or `STATUS-REPLY` from earlier versions) in the same
+selected thread/turn. Old matching text, notifications,
 accepted requests alone, wrong message IDs, and replies in another turn are not
 success. Replies remain untrusted text and are never executed. Correlation is
 not cryptographic proof against a malicious server or local account.
@@ -71,12 +91,11 @@ bounded, but each RPC also has its own timeout. Legacy servers may replay histor
 internally on each turns-list request. Full thread access through this socket is
 more powerful than the adapter's narrow command set.
 
-Exit codes: `0` correlated reply (or completed listing), `1` preflight/connection
-failure, `2` uncertain send or missing reply after attempting a send. Every error
-after entering the send call is conservatively uncertain, including JSON-RPC
-errors. There are **no automatic retries**. Inspect existing evidence through an
-authorized route before any future action. The adapter does not reconcile an
-uncertain outcome automatically.
+Exit codes: `0` correlated reply (or completed listing), `1` argument, preflight or
+connection failure, `2` uncertain send or missing reply after attempting a send.
+Every error after entering the send call is conservatively uncertain, including
+JSON-RPC errors. There are **no automatic retries**. Use `collect` for a late reply;
+it never sends.
 
 ## Tests
 
@@ -86,7 +105,8 @@ python -m unittest test_codex_adapter.py -v
 
 The mock suite covers stale identities/turns, unloaded targets, direct-input
 restrictions, preflight and send permission failures, turn races, wrong and old
-replies, uncertain outcomes, persistent duplicate refusal, RPC response identity,
+replies, uncertain outcomes, persistent duplicate refusal, earlier receipt files,
+idle-thread `turn/start`, read-only late collection, RPC response identity,
 unanswered approval requests, connection denial, and idempotent proxy cleanup.
 Its in-memory wire server launches no subprocess or network listener. Only the
 production transport would launch the supplied Codex binary's **proxy** child;
