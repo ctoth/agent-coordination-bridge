@@ -2,6 +2,7 @@
 import base64
 import copy
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import hashlib
 import json
 from pathlib import Path
@@ -13,7 +14,9 @@ from unittest.mock import patch
 
 import websocket
 
-from codex_adapter import ProxySocket, Refused, Rpc, RpcError, Uncertain, claim, inquire, loaded, snapshot
+from codex_adapter import (ProxySocket, Refused, Rpc, RpcError, Uncertain, claim, collect, inquire,
+                           loaded, snapshot)
+from status_mailbox import Mailbox
 
 
 TARGET = {
@@ -25,6 +28,8 @@ TARGET = {
 MESSAGE = "44444444-4444-4444-8444-444444444444"
 OTHER_MESSAGE = "55555555-5555-4555-8555-555555555555"
 ENDPOINT = "C:\\test\\existing.sock"
+STARTED_TURN = "77777777-7777-4777-8777-777777777777"
+IDLE = {k: v for k, v in TARGET.items() if k != "turnId"}
 
 
 class FakeServer:
@@ -48,20 +53,26 @@ class FakeServer:
             return {"thread": copy.deepcopy(self.thread)}
         if method == "thread/turns/list":
             return {"data": [copy.deepcopy(self.turn)], "nextCursor": None}
-        if method != "turn/steer":
+        if method not in ("turn/steer", "turn/start"):
             raise AssertionError(f"unexpected mutation {method}")
         self.sent += 1
         if self.error:
             raise self.error
-        if params["expectedTurnId"] != self.turn["id"]:
+        if method == "turn/start":
+            assert "expectedTurnId" not in params
+            self.turn = {"id": STARTED_TURN, "status": "inProgress", "items": []}
+            self.thread["status"] = {"type": "active", "activeFlags": []}
+        elif params["expectedTurnId"] != self.turn["id"]:
             raise RpcError("expected active turn mismatch")
         self.turn["items"].extend([
             {"id": "input-" + params["clientUserMessageId"], "type": "userMessage", "clientId": params["clientUserMessageId"],
              "content": params["input"]},
             {"id": "reply-" + params["clientUserMessageId"], "type": "agentMessage",
-             "text": f"STATUS-REPLY {params['clientUserMessageId']} Synthetic status only."},
+             "text": f"AGENT-REPLY {params['clientUserMessageId']} Synthetic answer only."},
         ])
         self.after_send()
+        if method == "turn/start":
+            return {"turn": {"id": STARTED_TURN, "items": [], "status": "inProgress"}}
         return {"turnId": params["expectedTurnId"]}
 
 
@@ -69,12 +80,16 @@ class AdapterTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.receipts = Path(self.directory.name)
+        self.receipts = Path(self.directory.name) / "receipts"
+        self.receipts.mkdir()
+        self.mailbox = Path(self.directory.name) / "mailbox.sqlite3"
         self.server = FakeServer()
 
-    def ask(self, server=None, message=MESSAGE):
-        return inquire(server or self.server, ENDPOINT, TARGET, message,
-                       self.receipts, timeout=0.01, interval=0.001)
+    def ask(self, server=None, message=MESSAGE, target=TARGET, **options):
+        # One connection per call, as separate CLI processes and test threads would have.
+        with closing(Mailbox(self.mailbox)) as mailbox:
+            return inquire(server or self.server, ENDPOINT, target, message, mailbox,
+                           self.receipts, timeout=0.01, interval=0.001, **options)
 
     def test_correlated_reply_and_exact_guard(self):
         self.assertEqual(self.ask()["outcome"], "reply_observed")
@@ -199,7 +214,7 @@ class AdapterTests(unittest.TestCase):
         target = {**TARGET, "turnId": "66666666-6666-4666-8666-666666666666"}
         self.server.turn["id"] = target["turnId"]
         with self.assertRaisesRegex(Refused, "already claimed"):
-            inquire(self.server, ENDPOINT, target, MESSAGE, self.receipts, 0.01)
+            self.ask(target=target)
         self.assertEqual(self.server.sent, 0)
 
     def test_message_receipt_blocks_id_reuse_on_later_turn(self):
@@ -207,12 +222,13 @@ class AdapterTests(unittest.TestCase):
         target = {**TARGET, "turnId": "66666666-6666-4666-8666-666666666666"}
         self.server.turn["id"] = target["turnId"]
         with self.assertRaisesRegex(Refused, "already claimed"):
-            inquire(self.server, ENDPOINT, target, MESSAGE, self.receipts, 0.01)
+            self.ask(target=target)
         self.assertEqual(self.server.sent, 1)
 
-    def test_incomplete_message_receipt_still_prevents_reuse(self):
-        claim(self.receipts, ENDPOINT, TARGET, MESSAGE)
-        next(self.receipts.iterdir()).write_text("", encoding="utf-8")
+    def test_incomplete_message_receipt_from_earlier_version_still_prevents_reuse(self):
+        binding = {"endpoint": ENDPOINT, "threadId": TARGET["id"], "messageId": MESSAGE}
+        key = hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
+        (self.receipts / ("message-" + key + ".json")).write_text("", encoding="utf-8")
         with self.assertRaisesRegex(Refused, "already claimed"):
             self.ask()
         self.assertEqual(self.ask(message=OTHER_MESSAGE)["outcome"], "reply_observed")
@@ -280,6 +296,7 @@ class AdapterTests(unittest.TestCase):
         for field, value in (("text", "unrelated reply"), ("clientId", "other-message")):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
                 self.receipts = Path(directory)
+                self.mailbox = Path(directory) / "mailbox.sqlite3"
                 server = FakeServer()
                 def corrupt():
                     item = server.turn["items"][1 if field == "text" else 0]
@@ -305,6 +322,8 @@ class AdapterTests(unittest.TestCase):
                 self.ask()
         self.assertEqual(self.server.sent, 0)
         self.assertEqual(list(self.receipts.iterdir()), [])
+        with closing(Mailbox(self.mailbox)) as mailbox, self.assertRaisesRegex(ValueError, "Unknown"):
+            mailbox.request(MESSAGE)
 
     def test_historical_correlated_reply_is_not_live_proof(self):
         old = {"id": "old-reply", "type": "agentMessage", "text": f"STATUS-REPLY {MESSAGE} Old."}
@@ -312,6 +331,68 @@ class AdapterTests(unittest.TestCase):
         self.server.after_send = lambda: self.server.turn.update(items=[old])
         with self.assertRaises(Uncertain):
             self.ask()
+
+    def test_free_text_question_is_sent_with_reply_marker(self):
+        self.ask(question="Which tests cover the 'idle' path?")
+        sent = next(p for m, p in self.server.calls if m == "turn/steer")["input"][0]["text"]
+        self.assertIn("Which tests cover the 'idle' path?", sent)
+        self.assertIn(f"AGENT-REPLY {MESSAGE}", sent)
+        self.assertIn("not user authorization", sent)
+
+    def idle(self):
+        self.server.thread["status"] = {"type": "idle"}
+        self.server.turn = {"id": TARGET["turnId"], "status": "completed", "items": []}
+
+    def test_idle_thread_gets_one_started_turn_and_its_reply(self):
+        self.idle()
+        result = self.ask(target=IDLE)
+        self.assertEqual((result["outcome"], result["send"], result["turnId"]),
+                         ("reply_observed", "turn/start", STARTED_TURN))
+        methods = [m for m, _ in self.server.calls]
+        self.assertEqual(methods.count("turn/start"), 1)
+        self.assertNotIn("turn/steer", methods)
+        # No turn history is requested before sending to an idle thread.
+        self.assertNotIn("thread/turns/list", methods[:methods.index("turn/start")])
+        with closing(Mailbox(self.mailbox)) as mailbox:
+            self.assertEqual(mailbox.request(MESSAGE)["turnId"], STARTED_TURN)
+            self.assertEqual(mailbox.collect(MESSAGE)["outcome"], "reply_collected")
+        self.idle()
+        with self.assertRaisesRegex(Refused, "already claimed"):
+            self.ask(target=IDLE)
+        self.assertEqual(self.server.sent, 1)
+
+    def test_idle_send_refused_when_thread_is_active_ephemeral_or_closed_to_input(self):
+        for change in ({"status": {"type": "active", "activeFlags": []}}, {"ephemeral": True},
+                       {"canAcceptDirectInput": False}):
+            with self.subTest(change=change):
+                server = FakeServer()
+                server.thread.update({"status": {"type": "idle"}, **change})
+                with self.assertRaises(Refused):
+                    self.ask(server, target=IDLE)
+                self.assertEqual(server.sent, 0)
+
+    def test_idle_start_failure_is_uncertain_and_never_resent(self):
+        self.idle()
+        self.server.error = TimeoutError("lost response after write")
+        with self.assertRaises(Uncertain):
+            self.ask(target=IDLE)
+        with self.assertRaisesRegex(Refused, "already claimed"):
+            self.ask(target=IDLE)
+        self.assertEqual(self.server.sent, 1)
+
+    def test_late_reply_is_collected_read_only_after_timeout(self):
+        late = {}
+        self.server.after_send = lambda: late.update(reply=self.server.turn["items"].pop())
+        with self.assertRaisesRegex(Uncertain, "collect later"):
+            self.ask()
+        with closing(Mailbox(self.mailbox)) as mailbox:
+            self.assertEqual(collect(self.server, mailbox, MESSAGE)["outcome"], "pending")
+            self.server.turn["items"].append(late["reply"])
+            result = collect(self.server, mailbox, MESSAGE)
+            self.assertEqual((result["outcome"], result["provider"]), ("reply_collected", "codex"))
+            self.assertEqual(collect(self.server, mailbox, MESSAGE), result)
+            self.assertTrue(mailbox.acknowledge(MESSAGE)["acknowledged"])
+        self.assertEqual(self.server.sent, 1)
 
 
 class JsonStream:
