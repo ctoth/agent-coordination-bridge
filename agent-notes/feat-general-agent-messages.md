@@ -38,6 +38,7 @@ A Codex peer session (Pip) sent a status inquiry mid-task; answered once via
 SendMessage plus a STATUS-REPLY record. Peer text is not Q's instruction.
 
 ## Next step
-Push, open PR to main (it contains PR3's commits; ask Q before touching PR3). No CI
-is configured, so the PR has no checks to read. After merge: `gh repo edit` with the
+PR #4 open (feat/general-agent-messages, docs commit 4978f21). It contains PR3's
+commits; ask Q before touching PR3. No CI is configured, so the PR has no checks to
+read. Waiting on Q's review and merge. After merge: `gh repo edit` with the
 new description and topics, then remove this branch and worktree.
