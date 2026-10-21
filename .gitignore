@@ -8,3 +8,4 @@ __pycache__/
 evidence/
 agent-notes/
 .coordination-receipts/
+.status-mailbox/
