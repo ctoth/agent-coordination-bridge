@@ -380,6 +380,27 @@ class AdapterTests(unittest.TestCase):
             self.ask(target=IDLE)
         self.assertEqual(self.server.sent, 1)
 
+    def test_accepted_start_with_lost_response_is_still_collected(self):
+        self.idle()
+        def lose_response():
+            raise TimeoutError("response lost after the server accepted the start")
+        self.server.after_send = lose_response
+        with self.assertRaises(Uncertain):
+            self.ask(target=IDLE)
+        with closing(Mailbox(self.mailbox)) as mailbox:
+            self.assertIsNone(mailbox.request(MESSAGE)["turnId"])
+            result = collect(self.server, mailbox, MESSAGE)
+        self.assertEqual((result["outcome"], result["turnId"]), ("reply_collected", STARTED_TURN))
+        self.assertEqual(self.server.sent, 1)
+
+    def test_lost_response_without_a_delivered_message_stays_pending(self):
+        self.idle()
+        self.server.error = TimeoutError("lost before the server accepted it")
+        with self.assertRaises(Uncertain):
+            self.ask(target=IDLE)
+        with closing(Mailbox(self.mailbox)) as mailbox:
+            self.assertEqual(collect(self.server, mailbox, MESSAGE)["outcome"], "pending")
+
     def test_late_reply_is_collected_read_only_after_timeout(self):
         late = {}
         self.server.after_send = lambda: late.update(reply=self.server.turn["items"].pop())

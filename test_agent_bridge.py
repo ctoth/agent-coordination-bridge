@@ -65,6 +65,15 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("differs", json.loads(out)["error"])
 
+    def test_zero_codex_timeout_is_refused_before_connecting(self):
+        with patch.object(codex_adapter, "ProxySocket", side_effect=AssertionError("must not connect")):
+            code, out = run(["ask", "--provider", "codex", "--codex", "C:\\codex.exe", "--socket", "C:\\s.sock",
+                             "--thread", "t", "--session", "s", "--cwd", "C:\\w", "--model", "m",
+                             "--request-id", "44444444-4444-4444-8444-444444444444", "--message", "hi",
+                             "--timeout", "0", "--mailbox", str(self.mailbox)])
+        self.assertEqual(code, 1)
+        self.assertIn("timeout", json.loads(out)["error"])
+
     def test_uncertain_codex_outcome_exits_2(self):
         @contextlib.contextmanager
         def lost(*args):

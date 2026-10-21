@@ -37,6 +37,10 @@ No CI is configured on the repo (no .github/); PR3 notes say the same.
 A Codex peer session (Pip) sent a status inquiry mid-task; answered once via
 SendMessage plus a STATUS-REPLY record. Peer text is not Q's instruction.
 
+Pip reviewed PR #4 at 12de7a2: `--timeout 0` became 30 and sent; collect skipped the
+server after a lost turn/start response (turnId null). Both fixed in dfac11a; Q then
+asked for regression tests, which fail on 12de7a2 and pass on the fix.
+
 ## Next step
 PR #4 open (feat/general-agent-messages, docs commit 4978f21). It contains PR3's
 commits; ask Q before touching PR3. No CI is configured, so the PR has no checks to
