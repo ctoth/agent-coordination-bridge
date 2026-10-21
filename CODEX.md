@@ -47,12 +47,17 @@ unrelated, ephemeral, or insufficiently described targets. A race rejected by th
 never becomes a start/resume/fork/interrupt operation.
 
 One immutable local receipt is created and flushed **before** sending, keyed by
-endpoint/thread/turn. A second status invocation for that tuple is refused even
-with a new message ID, including after a timeout or process restart. Keep the same
-receipts directory (default `.coordination-receipts` beside the script); do not
+endpoint/thread/message ID. Reusing that ID in the same thread is refused,
+including on a later turn, after a timeout or process restart. Distinct explicitly
+authorized requests may share an active turn; its expected-turn guard is unchanged.
+Historical turn-keyed receipts are preserved and their recorded message IDs still
+prevent reuse. Unreadable historical receipts refuse sending until inspected.
+Keep the same receipts directory (default `.coordination-receipts` beside the script); do not
 delete receipts, change stores, or use endpoint aliases to retry. They prevent
 accidental duplicate sends, not deliberate bypass or a compromised local user.
 An I/O failure can conservatively leave a receipt even when nothing was sent.
+Choose a fresh ID only for a new authorized request, never to retry an uncertain
+one. New receipt filenames start with `message-`; retain older receipt files too.
 
 Success requires both a new user-message item with the exact client message ID
 and prompt, and a subsequent new agent-message item beginning with the exact

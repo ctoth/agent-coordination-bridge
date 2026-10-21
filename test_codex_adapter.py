@@ -1,17 +1,19 @@
 """Synthetic protocol tests. Nothing here connects to a real Codex server."""
 import base64
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
 import queue
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
 import websocket
 
-from codex_adapter import ProxySocket, Refused, Rpc, RpcError, Uncertain, inquire, loaded, snapshot
+from codex_adapter import ProxySocket, Refused, Rpc, RpcError, Uncertain, claim, inquire, loaded, snapshot
 
 
 TARGET = {
@@ -21,6 +23,7 @@ TARGET = {
     "cwd": "C:\\test\\worktree", "model": "test-model",
 }
 MESSAGE = "44444444-4444-4444-8444-444444444444"
+OTHER_MESSAGE = "55555555-5555-4555-8555-555555555555"
 ENDPOINT = "C:\\test\\existing.sock"
 
 
@@ -53,9 +56,9 @@ class FakeServer:
         if params["expectedTurnId"] != self.turn["id"]:
             raise RpcError("expected active turn mismatch")
         self.turn["items"].extend([
-            {"id": "input", "type": "userMessage", "clientId": params["clientUserMessageId"],
+            {"id": "input-" + params["clientUserMessageId"], "type": "userMessage", "clientId": params["clientUserMessageId"],
              "content": params["input"]},
-            {"id": "reply", "type": "agentMessage",
+            {"id": "reply-" + params["clientUserMessageId"], "type": "agentMessage",
              "text": f"STATUS-REPLY {params['clientUserMessageId']} Synthetic status only."},
         ])
         self.after_send()
@@ -165,11 +168,113 @@ class AdapterTests(unittest.TestCase):
             self.ask(fresh)
         self.assertEqual(fresh.sent, 0)
 
-    def test_duplicate_even_with_new_message_id(self):
+    def test_distinct_messages_share_active_turn_but_same_id_cannot_repeat(self):
         self.ask()
+        self.assertEqual(self.ask(message=OTHER_MESSAGE)["outcome"], "reply_observed")
         with self.assertRaisesRegex(Refused, "already claimed"):
-            self.ask(message="55555555-5555-4555-8555-555555555555")
+            self.ask()
+        self.assertEqual(self.server.sent, 2)
+        self.assertEqual({p["expectedTurnId"] for m, p in self.server.calls if m == "turn/steer"},
+                         {TARGET["turnId"]})
+
+    def historical_receipt(self, message=MESSAGE):
+        binding = {"endpoint": ENDPOINT, "threadId": TARGET["id"], "turnId": TARGET["turnId"]}
+        key = hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
+        path = self.receipts / (key + ".json")
+        path.write_text(json.dumps({**binding, "messageId": message,
+                                   "state": "claimed; outcome may be uncertain"}), encoding="utf-8")
+        return path
+
+    def test_historical_receipt_blocks_same_id_but_allows_distinct_message(self):
+        path = self.historical_receipt()
+        before = path.read_bytes()
+        with self.assertRaisesRegex(Refused, "already claimed"):
+            self.ask()
+        self.assertEqual(self.ask(message=OTHER_MESSAGE)["outcome"], "reply_observed")
+        self.assertEqual(path.read_bytes(), before)
         self.assertEqual(self.server.sent, 1)
+
+    def test_historical_receipt_also_blocks_id_reuse_on_later_turn(self):
+        self.historical_receipt()
+        target = {**TARGET, "turnId": "66666666-6666-4666-8666-666666666666"}
+        self.server.turn["id"] = target["turnId"]
+        with self.assertRaisesRegex(Refused, "already claimed"):
+            inquire(self.server, ENDPOINT, target, MESSAGE, self.receipts, 0.01)
+        self.assertEqual(self.server.sent, 0)
+
+    def test_message_receipt_blocks_id_reuse_on_later_turn(self):
+        self.ask()
+        target = {**TARGET, "turnId": "66666666-6666-4666-8666-666666666666"}
+        self.server.turn["id"] = target["turnId"]
+        with self.assertRaisesRegex(Refused, "already claimed"):
+            inquire(self.server, ENDPOINT, target, MESSAGE, self.receipts, 0.01)
+        self.assertEqual(self.server.sent, 1)
+
+    def test_incomplete_message_receipt_still_prevents_reuse(self):
+        claim(self.receipts, ENDPOINT, TARGET, MESSAGE)
+        next(self.receipts.iterdir()).write_text("", encoding="utf-8")
+        with self.assertRaisesRegex(Refused, "already claimed"):
+            self.ask()
+        self.assertEqual(self.ask(message=OTHER_MESSAGE)["outcome"], "reply_observed")
+        self.assertEqual(self.server.sent, 1)
+
+    def test_unreadable_historical_receipt_refuses_without_sending(self):
+        path = self.historical_receipt()
+        path.write_text("{", encoding="utf-8")
+        with self.assertRaisesRegex(Refused, "legacy receipt"):
+            self.ask(message=OTHER_MESSAGE)
+        self.assertEqual(self.server.sent, 0)
+
+    def test_uncertain_message_remains_claimed_while_distinct_message_is_allowed(self):
+        self.server.error = TimeoutError("response lost after write")
+        with self.assertRaises(Uncertain):
+            self.ask()
+        fresh = FakeServer()
+        self.assertEqual(self.ask(fresh, OTHER_MESSAGE)["outcome"], "reply_observed")
+        with self.assertRaisesRegex(Refused, "already claimed"):
+            self.ask(fresh)
+        self.assertEqual(self.server.sent, 1)
+        self.assertEqual(fresh.sent, 1)
+
+    def concurrent_asks(self, messages, error=None):
+        barrier = threading.Barrier(2)
+        servers = [FakeServer(), FakeServer()]
+        for server in servers:
+            server.error = error
+
+        def synchronized_claim(*args):
+            barrier.wait(timeout=5)
+            return claim(*args)
+
+        def ask_one(index):
+            try:
+                return self.ask(servers[index], messages[index])["outcome"]
+            except Refused:
+                return "refused"
+            except Uncertain:
+                return "uncertain"
+
+        with patch("codex_adapter.claim", side_effect=synchronized_claim):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                outcomes = list(pool.map(ask_one, range(2)))
+        return outcomes, sum(server.sent for server in servers)
+
+    def test_concurrent_same_id_sends_once(self):
+        outcomes, sends = self.concurrent_asks([MESSAGE, MESSAGE])
+        self.assertCountEqual(outcomes, ["reply_observed", "refused"])
+        self.assertEqual(sends, 1)
+
+    def test_concurrent_distinct_ids_both_send(self):
+        outcomes, sends = self.concurrent_asks([MESSAGE, OTHER_MESSAGE])
+        self.assertEqual(outcomes, ["reply_observed", "reply_observed"])
+        self.assertEqual(sends, 2)
+
+    def test_concurrent_uncertain_same_id_still_sends_once(self):
+        outcomes, sends = self.concurrent_asks([MESSAGE, MESSAGE], TimeoutError("lost response"))
+        self.assertCountEqual(outcomes, ["uncertain", "refused"])
+        self.assertEqual(sends, 1)
+        with self.assertRaisesRegex(Refused, "already claimed"):
+            self.ask()
 
     def test_wrong_reply_or_receipt_is_not_success(self):
         for field, value in (("text", "unrelated reply"), ("clientId", "other-message")):

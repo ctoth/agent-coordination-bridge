@@ -163,16 +163,32 @@ def verify(thread, turns, target, active):
 
 
 def claim(receipts, endpoint, target, message_id):
-    binding = {"endpoint": endpoint, "threadId": target["id"], "turnId": target["turnId"]}
+    binding = {"endpoint": endpoint, "threadId": target["id"], "messageId": message_id}
     key = hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
     receipts.mkdir(parents=True, exist_ok=True)
+    # Historical turn-keyed receipts remain authoritative for their message IDs.
+    # New files have a prefix so another concurrent writer's partial file is
+    # never parsed: exclusive creation alone arbitrates the new message key.
+    for legacy in receipts.glob("*.json"):
+        if legacy.name.startswith("message-"):
+            continue
+        try:
+            previous = json.loads(legacy.read_text(encoding="utf-8"))
+            if not isinstance(previous, dict) or not all(
+                previous.get(field) for field in ("endpoint", "threadId", "messageId")
+            ):
+                raise ValueError("missing receipt identity")
+        except (OSError, ValueError) as error:
+            raise Refused("legacy receipt unreadable; preserve it and inspect before sending") from error
+        if all(previous.get(field) == value for field, value in binding.items()):
+            raise Refused("this endpoint/thread/message was already claimed; do not resend")
     try:
-        with (receipts / (key + ".json")).open("x", encoding="utf-8") as output:
-            json.dump({**binding, "messageId": message_id, "state": "claimed; outcome may be uncertain"}, output)
+        with (receipts / ("message-" + key + ".json")).open("x", encoding="utf-8") as output:
+            json.dump({**binding, "turnId": target["turnId"], "state": "claimed; outcome may be uncertain"}, output)
             output.flush()
             os.fsync(output.fileno())
     except FileExistsError as error:
-        raise Refused("this endpoint/thread/turn was already claimed; do not resend") from error
+        raise Refused("this endpoint/thread/message was already claimed; do not resend") from error
 
 
 def status_prompt(message_id):
