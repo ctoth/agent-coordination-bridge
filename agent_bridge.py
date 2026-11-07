@@ -31,7 +31,8 @@ def parser():
     codex.add_argument("--thread")
     codex.add_argument("--session")
     codex.add_argument("--turn", help="active turn to steer; omit to start a turn on an idle thread")
-    codex.add_argument("--cwd")
+    codex.add_argument("--cwd", help="ask/status: the target's exact cwd; list: show only threads whose cwd "
+                                     "is this directory or contains it")
     codex.add_argument("--model")
     codex.add_argument("--receipts", type=Path, default=HERE / ".coordination-receipts",
                        help="receipt files from earlier versions; read, never written")
@@ -68,7 +69,7 @@ def run(args):
             claude.ask(cli, target, timeout, mailbox, args.request_id, question)  # prints its own evidence
         return None, 0
     if args.command == "list":
-        return codex_run(args, None, lambda codex, rpc, endpoint: codex.listing(rpc, endpoint))
+        return codex_run(args, None, lambda codex, rpc, endpoint: codex.listing(rpc, endpoint, args.cwd))
     if not all((args.thread, args.session, args.cwd, args.model, args.request_id)):
         raise ValueError(f"{args.command} requires --thread, --session, --cwd, --model and --request-id; "
                          "add --turn to steer an active turn")

@@ -335,10 +335,23 @@ def connect(codex, endpoint, timeout):
         pipe.close()
 
 
-def listing(rpc, endpoint):
+def covers(thread_cwd, directory):
+    """True when directory is thread_cwd or lies inside it (case and separators per this OS)."""
+    if not thread_cwd:
+        return False
+    parent, child = (os.path.normcase(os.path.normpath(p)) for p in (thread_cwd, directory))
+    try:
+        return os.path.commonpath([parent, child]) == parent
+    except ValueError:  # different drives
+        return False
+
+
+def listing(rpc, endpoint, cwd=None):
     result = []
     for thread_id in loaded(rpc):
         thread, turns = snapshot(rpc, thread_id, active_only=True)
+        if cwd is not None and not covers(thread.get("cwd"), cwd):
+            continue
         result.append({k: thread.get(k) for k in (
             "id", "sessionId", "cwd", "model", "status", "parentThreadId", "forkedFromId", "gitInfo",
             "ephemeral", "canAcceptDirectInput"
