@@ -15,7 +15,7 @@ from unittest.mock import patch
 import websocket
 
 from codex_adapter import (ProxySocket, Refused, Rpc, RpcError, Uncertain, claim, collect, inquire,
-                           loaded, snapshot)
+                           listing, loaded, snapshot)
 from status_mailbox import Mailbox
 
 
@@ -123,6 +123,16 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(thread["status"]["type"], "idle")
         self.assertEqual(turns, [])
         self.assertEqual([m for m, _ in self.server.calls], ["thread/read"])
+
+    def test_listing_filters_to_threads_whose_cwd_covers_the_directory(self):
+        def ids(cwd):
+            return [t["id"] for t in listing(self.server, ENDPOINT, cwd)["threads"]]
+        self.assertEqual(ids(None), [TARGET["id"]])
+        self.assertEqual(ids("c:/TEST/worktree"), [TARGET["id"]])
+        self.assertEqual(ids("C:\\test\\worktree\\repo"), [TARGET["id"]])
+        self.assertEqual(ids("C:\\test\\worktree2"), [])
+        self.assertEqual(ids("C:\\test"), [])
+        self.assertEqual(ids("D:\\test\\worktree"), [])
 
     def test_ephemeral_thread_is_listable_but_not_pollable(self):
         self.server.thread["ephemeral"] = True

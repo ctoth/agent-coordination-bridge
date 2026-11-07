@@ -60,6 +60,8 @@ python agent_bridge.py ack --request-id ask-<32 hex>       # mark it handled loc
 
 ```sh
 python agent_bridge.py list --provider codex --codex <abs-codex-binary> --socket <abs-socket>
+# only threads working in this repo (thread cwd is the directory or one of its parents):
+python agent_bridge.py list --provider codex --codex <abs-codex-binary> --socket <abs-socket> --cwd <repo-dir>
 
 python agent_bridge.py ask --provider codex --codex <abs-codex-binary> --socket <abs-socket> \
   --thread <UUID> --session <UUID> --cwd <exact-cwd> --model <exact-model> \
